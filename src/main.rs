@@ -14,7 +14,7 @@ fn main() {
 
     let mut payload = payload.as_mut().unwrap();
 
-    let res = payload.extract("boot", "out/boot.img", &|progress| println!("{}%", progress));
+    let res = payload.get_partition_list();
 
     match res {
         Ok(res) => println!("{}", res),

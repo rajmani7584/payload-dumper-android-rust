@@ -1,8 +1,8 @@
-use std::{error::Error, fs::File, io::{self, BufReader, Read, Seek, SeekFrom}, str};
+use std::{error::Error, fs::File, io::{self, BufReader, Read, Seek, SeekFrom, Write}, str};
 use bzip2::read::BzDecoder;
-use liblzma::bufread::XzDecoder;
-use std::fmt::Write;
-use sha2::{Digest, Sha256};
+use liblzma::read::XzDecoder;
+use sha2::{Sha256, Digest};
+use zip::ZipArchive;
 
 use crate::chromeos_update_engine::{install_operation::Type, DeltaArchiveManifest, PartitionUpdate};
 
@@ -10,11 +10,23 @@ const PAYLOAD_HEADER_MAGIC: &str = "CrAU";
 const BRILLO_MAJOR_PAYLOAD_VERSION: u64 = 2;
 const BLOCK_SIZE: u64 = 4096;
 
+#[derive(Debug)]
+struct CError(String);
+
+impl Error for CError {}
+
+impl std::fmt::Display for CError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 pub struct Payload {
     path: String,
     file: File,
+    zip_offset: u64,
     header: Option<PayloadHeader>,
-    manifest: Option<DeltaArchiveManifest>
+    manifest: Option<DeltaArchiveManifest>,
 }
 
 pub struct PayloadHeader {
@@ -27,37 +39,81 @@ pub struct PayloadHeader {
 }
 
 impl Payload {
-    pub fn new(path: String) -> Result<Self, Box<dyn Error>> {
-        let file = File::open(&path).map_err(|err| format!("File open error: {}", err))?;
-        Ok(Self { path, file, header: None, manifest: None })
+    pub fn new(path: String) -> Result<Payload, Box<dyn Error>> {
+        let mut file = match File::open(path.clone()) {
+            Ok(f) => f,
+            Err(err) => {
+                return Err(format!("Err: {}", err).into());
+            }
+        };
+        let mut offset: u64 = 0;
+        if path.ends_with(".zip") {
+            let mut archive = ZipArchive::new(&mut file)?;
+            offset = archive.by_name("payload.bin").or(Err("/payload.bin not found inside zip"))?.data_start();
+        }
+        Ok(Payload {
+            path,
+            file,
+            zip_offset: offset,
+            header: None,
+            manifest: None,
+        })
     }
 
     fn init(&mut self) -> Result<(), Box<dyn Error>> {
-        self.header = Some(self.read_header()?);
-        self.manifest = Some(self.read_manifest()?);
+
+        let _ = self.file.seek(SeekFrom::Start(self.zip_offset))?;
+
+        match self.read_header() {
+            Ok(header) => self.header = Some(header),
+            Err(err) => {
+                return Err(err);
+            }
+        }
+
+        match self.read_manifest() {
+            Ok(manifest) => self.manifest = Some(manifest),
+            Err(err) => {
+                return Err(err);
+            }
+        }
         Ok(())
     }
 
     fn read_header(&mut self) -> Result<PayloadHeader, Box<dyn Error>> {
         let mut buf = [0; 4];
+
         self.file.read_exact(&mut buf)?;
+
         if str::from_utf8(&buf)? != PAYLOAD_HEADER_MAGIC {
             return Err("Invalid Payload magic".into());
         }
-
         let mut header = PayloadHeader {
-            version: self.read_u64()?,
-            manifest_len: self.read_u64()?,
-            signature_len: self.read_u32()?,
-            size: 24,
-            metadata_size: 0,
+            version: 0,
+            manifest_len: 0,
+            signature_len: 0,
+            size: 0,
             data_offset: 0,
+            metadata_size: 0
         };
+
+        let mut buf = [0; 8];
+        self.file.read_exact(&mut buf)?;
+        header.version = u64::from_be_bytes(buf);
 
         if header.version != BRILLO_MAJOR_PAYLOAD_VERSION {
             return Err("Unsupported payload version".into());
         }
 
+        let mut buf = [0; 8];
+        self.file.read_exact(&mut buf)?;
+        header.manifest_len = u64::from_be_bytes(buf);
+
+        let mut buf = [0; 4];
+        self.file.read_exact(&mut buf)?;
+        header.signature_len = u32::from_be_bytes(buf);
+
+        header.size = 24;
         header.metadata_size = header.size + header.manifest_len;
         header.data_offset = header.signature_len as u64 + header.metadata_size;
 
@@ -65,54 +121,77 @@ impl Payload {
     }
 
     fn read_manifest(&mut self) -> Result<DeltaArchiveManifest, Box<dyn Error>> {
-        let manifest_len = self.header.as_ref().ok_or("Missing header")?.manifest_len as usize;
+        let manifest_len = self.header.as_ref().ok_or(Box::new(CError("header not found".into())))?.manifest_len as usize;
         let mut manifest_buf = vec![0; manifest_len];
+
         self.file.read_exact(&mut manifest_buf)?;
-        Ok(prost::Message::decode(&manifest_buf[..])?)
+
+        let delta_manifest: DeltaArchiveManifest = prost::Message::decode(&manifest_buf[..])?;
+
+        Ok(delta_manifest)
     }
 
-    pub fn extract<'p>(&mut self, partition_to_extract: &str, out_file: &str, onprpgress: &'p dyn Fn(usize)) -> Result<String, Box<dyn Error>> {
-        self.init()?;
-        let manifest = self.manifest.as_ref().ok_or("Manifest not initialized")?;
+    pub fn extract<'p>(&mut self, partition_to_extract: &str, out_file: &str, onprogress: &'p dyn Fn(usize), onverify: &'p dyn Fn(i8)) -> Result<String, Box<dyn Error>> {
+        if let Err(err) = self.init() {
+            return Err(err);
+        }
 
-        for partition in manifest.partitions.clone() {
-            if partition.partition_name == partition_to_extract {
-                self.extract_selected(&partition, out_file, &onprpgress)?;
-                return Ok("Done".into());
+        if let Some(manifest) = &self.manifest {
+            let mut partition: Option<&PartitionUpdate> = None;
+            let partitions = manifest.partitions.clone();
+            for (_, p) in partitions.iter().enumerate() {
+                if partition_to_extract == p.partition_name {
+                    partition = Some(p);
+                    if let Err(err) = self.extract_selected(p, out_file, &onprogress, &onverify) {
+                        return Err(err);
+                    }
+                };
+            }
+            if partition.is_none() {
+                return Err(format!("partition: {} not found in {}", partition_to_extract, &self.path).into());
             }
         }
-        Err(format!("Partition {} not found", partition_to_extract).into())
+
+        Ok("Done".into())
     }
 
+    fn extract_selected<'p>(&mut self, partition: &PartitionUpdate, out_file: &str, onprogress: &'p dyn Fn(usize), onverify: &'p dyn Fn(i8)) -> Result<(), Box<dyn Error>> {
+        let mut output_file = match File::create(out_file) {
+            Ok(f) => {
+                f
+            }
+            Err(err) => {
+                return Err(format!("file create error: {}", err).into());
+            }
+        };
+        let name = &partition.partition_name;
+        let total_operations = partition.operations.len();
+        let size = partition.new_partition_info.as_ref().ok_or(Box::new(CError("partition size not found".into())))?.size.expect("size not found");
+        let hash_encoded = partition.new_partition_info.as_ref().ok_or(Box::new(CError("partition hash not found".into())))?.hash.as_ref().ok_or(Box::new(CError("partition hash not found".into())))?.clone();
+        let mut progress_track: usize = 0;
 
-    fn extract_selected<'p>(&mut self, partition: &PartitionUpdate, out_file: &str, onprogress: &'p dyn Fn(usize)) -> Result<(), Box<dyn Error>> {
-        let mut output_file = File::create(out_file)
-            .map_err(|err| format!("Failed to create output file: {}", err))?;
         let mut reader = BufReader::new(&self.file);
 
-        let mut progress: usize = 0;
-        let operation_len = partition.operations.len();
-
         for operation in &partition.operations {
-            let dst = operation.dst_extents.get(0)
-                .ok_or("Invalid destination extents in operation")?;
-            let data_offset = operation.data_offset
-                .ok_or("Missing data offset in operation")? + self.header.as_ref().unwrap().data_offset;
-            let data_length = operation.data_length
-                .ok_or("Missing data length in operation")?;
-            let expected_size = dst.num_blocks() * BLOCK_SIZE;
+            if operation.dst_extents.is_empty() {
+                return Err(format!("invalid dstextents for partition: {}", name).into());
+            }
 
-            reader.seek(SeekFrom::Start(data_offset))?;
+            let dst = operation.dst_extents[0];
+            let data_offset = operation.data_offset.ok_or(Box::new(CError("data length not found".into())))? + self.header.as_ref().ok_or(Box::new(CError("data length not found".into())))?.data_offset;
+            let data_length = operation.data_length.ok_or(Box::new(CError("data length not found".into())))?;
+            let expected_uncompress_block_size = dst.num_blocks() * BLOCK_SIZE;
 
-            let mut sha = Sha256::new();
-
+            let _ = reader.seek(SeekFrom::Start(self.zip_offset + data_offset));
             let mut reader = Read::take(&mut reader, data_length);
-            let mut buf = vec![0; data_length as usize];
-            let _ = reader.read(&mut buf);
-            sha.update(&mut buf);
 
-            // println!("Offset: {}, Length: {}", &data_offset, &data_length);
-            let mut bytes_written: u64 = 0;
+            let mut sha_buf = Sha256::new();
+            let mut buf = vec![0; data_length as usize];
+            let _ = reader.read(&mut buf)?;
+
+            sha_buf.update(&mut buf);
+
+            let bytes_written: u64;
             match operation.r#type() {
                 Type::Replace => {
                     bytes_written = io::copy(&mut buf.as_slice(), &mut output_file)?;
@@ -120,54 +199,72 @@ impl Payload {
                 Type::ReplaceXz => {
                     let mut decoder = XzDecoder::new(buf.as_slice());
                     bytes_written = io::copy(&mut decoder, &mut output_file)?;
-
                 },
                 Type::ReplaceBz => {
-                    bytes_written = io::copy(&mut BzDecoder::new(buf.as_slice()), &mut output_file)?;
+                    let mut decoder = BzDecoder::new(buf.as_slice());
+                    bytes_written = io::copy(&mut decoder, &mut output_file)?;
                 },
                 Type::Zero => {
-                    bytes_written = io::copy(&mut io::repeat(0).take(expected_size), &mut output_file)?;
+                    let mut filler = io::repeat(0).take(expected_uncompress_block_size);
+                    bytes_written = io::copy(&mut filler, &mut output_file)?;
+                },
+                _ => {
+                    return Err(format!("Unsupported operation type: {}", operation.r#type).into());
                 }
-                _ => return Err("Unsupported operation type".into()),
             }
-            let hash = hex::encode(sha.finalize());
-            let hash_expected = hex::encode(operation.data_sha256_hash());
-            if bytes_written != expected_size {
+            if bytes_written != expected_uncompress_block_size {
                 return Err("Unexpected byte written".into());
             }
-            if hash != hash_expected {
-                println!("hash mismatched{:?}\n{:?}", hash, hash_expected);
-                return Err("hash mismatch".into())
+            let new_hash = hex::encode(sha_buf.finalize());
+            let expected_hash = hex::encode(operation.data_sha256_hash());
+            if new_hash != expected_hash {
+                return Err("Hash mismatch error".into());
             }
-						progress += 1;
-            onprogress((progress * 100) / operation_len);
+            progress_track += 1;
+            onprogress((progress_track * 100) / total_operations);
         }
+
+        output_file.flush()?;
+        onverify(0);
+        let mut hasher = Sha256::new();
+        let mut file = File::open(&out_file)?;
+        let mut buf = vec![0; size as usize];
+        let _ = file.read(&mut buf);
+        hasher.update(&mut buf);
+        let hash = hex::encode(hash_encoded);
+        let new_hash = hex::encode(hasher.finalize());
+        if hash != new_hash {
+            onverify(2);
+            return Err("Hash mismatch error".into());
+        }
+        onverify(1);
+
         Ok(())
     }
 
     pub fn get_partition_list(&mut self) -> Result<String, Box<dyn Error>> {
-        self.init()?;
-        let manifest = self.manifest.as_ref().ok_or("No manifest available")?;
-        let mut msg = String::from("Partitions: ");
-        for (i, partition) in manifest.partitions.iter().enumerate() {
-            let size = partition.new_partition_info.as_ref().and_then(|info| info.size).unwrap_or(0);
-            write!(msg, "{}|{}", partition.partition_name, size).unwrap();
-            if i < manifest.partitions.len() - 1 {
-                msg.push_str(", ");
-            }
+
+
+        if let Err(err) = self.init() {
+            return Err(err);
         }
-        Ok(msg)
-    }
 
-    fn read_u64(&mut self) -> Result<u64, Box<dyn Error>> {
-        let mut buf = [0; 8];
-        self.file.read_exact(&mut buf)?;
-        Ok(u64::from_be_bytes(buf))
-    }
+        if let Some(manifest) = &self.manifest {
 
-    fn read_u32(&mut self) -> Result<u32, Box<dyn Error>> {
-        let mut buf = [0; 4];
-        self.file.read_exact(&mut buf)?;
-        Ok(u32::from_be_bytes(buf))
+            if let Some(header) = &self.header {
+            println!("Partition list: \nVersion:{}\nManifest Length:{}\nSignature Length:{}\nSecurity Patch Level:{}\n", header.version, header.manifest_len, header.signature_len, manifest.security_patch_level());
+            }
+
+            for (_i, partition) in manifest.partitions.iter().enumerate() {
+                let partition_name = &partition.partition_name;
+                let partition_size = partition.new_partition_info.as_ref().map_or(0, |info| info.size.expect("info size not found"));
+                let partition_hash = partition.new_partition_info.as_ref().and_then( |info| info.hash.clone()).expect("msg");
+
+                println!("Name: {}|Size: {:?}|Hash: {},", partition_name, partition_size, hex::encode(partition_hash));
+            }
+        } else {
+            println!("No partitions found");
+        }
+        Ok("Done".into())
     }
 }

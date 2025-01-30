@@ -178,8 +178,8 @@ impl Payload {
             }
 
             let dst = operation.dst_extents[0];
-            let data_offset = operation.data_offset.ok_or(Box::new(CError("data length not found".into())))? + self.header.as_ref().ok_or(Box::new(CError("data length not found".into())))?.data_offset;
-            let data_length = operation.data_length.ok_or(Box::new(CError("data length not found".into())))?;
+            let data_offset = operation.data_offset.unwrap_or(0) + self.header.as_ref().ok_or(Box::new(CError("data length not found".into())))?.data_offset;
+            let data_length = operation.data_length.unwrap_or(0);
             let expected_uncompress_block_size = dst.num_blocks() * BLOCK_SIZE;
 
             let _ = reader.seek(SeekFrom::Start(self.zip_offset + data_offset));
@@ -217,8 +217,10 @@ impl Payload {
             }
             let new_hash = hex::encode(sha_buf.finalize());
             let expected_hash = hex::encode(operation.data_sha256_hash());
-            if new_hash != expected_hash {
-                return Err("Hash mismatch error".into());
+            if expected_hash != "" {
+                if new_hash != expected_hash {
+                    return Err(format!("Operation Hash mismatch error, type: {}", operation.r#type).into());
+                }
             }
             progress_track += 1;
             onprogress((progress_track * 100) / total_operations);
@@ -241,7 +243,7 @@ impl Payload {
         let new_hash = hex::encode(hasher.finalize());
         if hash != new_hash {
             onverify(2);
-            return Err("Hash mismatch error".into());
+            return Err(format!("Partition Hash mismatch error, file hash: {}", new_hash).into());
         }
         onverify(1);
 

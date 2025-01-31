@@ -167,7 +167,6 @@ impl Payload {
         let name = &partition.partition_name;
         let total_operations = partition.operations.len();
         let size = partition.new_partition_info.as_ref().ok_or(Box::new(CError("partition size not found".into())))?.size.expect("size not found");
-        let hash_encoded = partition.new_partition_info.as_ref().ok_or(Box::new(CError("partition hash not found".into())))?.hash.as_ref().ok_or(Box::new(CError("partition hash not found".into())))?.clone();
         let mut progress_track: usize = 0;
 
         let mut reader = BufReader::new(&self.file);
@@ -178,7 +177,7 @@ impl Payload {
             }
 
             let dst = operation.dst_extents[0];
-            let data_offset = operation.data_offset.unwrap_or(0) + self.header.as_ref().ok_or(Box::new(CError("data length not found".into())))?.data_offset;
+            let data_offset = operation.data_offset.unwrap_or(0) + self.header.as_ref().ok_or(Box::new(CError("header not found".into())))?.data_offset;
             let data_length = operation.data_length.unwrap_or(0);
             let expected_uncompress_block_size = dst.num_blocks() * BLOCK_SIZE;
 
@@ -190,7 +189,7 @@ impl Payload {
             let _ = reader.read(&mut buf)?;
 
             sha_buf.update(&mut buf);
-
+            
             let bytes_written: u64;
             match operation.r#type() {
                 Type::Replace => {
@@ -219,7 +218,7 @@ impl Payload {
             let expected_hash = hex::encode(operation.data_sha256_hash());
             if expected_hash != "" {
                 if new_hash != expected_hash {
-                    return Err(format!("Operation Hash mismatch error, type: {}", operation.r#type).into());
+                    return Err("Operation Hash mismatch error".into());
                 }
             }
             progress_track += 1;
@@ -228,22 +227,24 @@ impl Payload {
 
         output_file.flush()?;
         onverify(0);
-        let mut hasher = Sha256::new();
-        let mut file = File::open(&out_file)?;
-				let mut reader = BufReader::new(file);
-        let mut buf = vec![0; 65536];
-				loop {
-					let bytes_read = reader.read(&mut buf)?;
-					if bytes_read == 0 {
-							break;
-					}
-					hasher.update(&buf[..bytes_read]);
-			}
+		let mut hasher = Sha256::new();
+		let file = File::open(&out_file)?;
+		let mut reader = BufReader::new(file);
+        let buf_size = if size > 1024 * 1024 { 1024 * 1024 } else { size as usize };
+		let mut buf = vec![0; buf_size];
+		loop {
+            let bytes_read = reader.read(&mut buf)?;
+            if bytes_read == 0 {
+                    break;
+            }
+            hasher.update(&buf[..bytes_read]);
+        }
+		let new_hash = hex::encode(hasher.finalize());
+        let hash_encoded = partition.new_partition_info.as_ref().ok_or(Box::new(CError("partition hash not found".into())))?.hash.as_ref().ok_or(Box::new(CError("partition hash not found".into())))?.clone();
         let hash = hex::encode(hash_encoded);
-        let new_hash = hex::encode(hasher.finalize());
         if hash != new_hash {
             onverify(2);
-            return Err(format!("Partition Hash mismatch error, file hash: {}", new_hash).into());
+            return Err("Partition Hash mismatch error".into());
         }
         onverify(1);
 
@@ -252,15 +253,16 @@ impl Payload {
 
     pub fn get_partition_list(&mut self) -> Result<String, Box<dyn Error>> {
 
+        let mut msg: String = Default::default();
 
         if let Err(err) = self.init() {
             return Err(err);
         }
-
+        
         if let Some(manifest) = &self.manifest {
 
             if let Some(header) = &self.header {
-            println!("Partition list: \nVersion:{}\nManifest Length:{}\nSignature Length:{}\nSecurity Patch Level:{}\n", header.version, header.manifest_len, header.signature_len, manifest.security_patch_level());
+            msg.insert_str(msg.len(), format!("data:{}|{}|{}|{}:", header.version, header.manifest_len, header.signature_len, manifest.security_patch_level()).as_str());
             }
 
             for (_i, partition) in manifest.partitions.iter().enumerate() {
@@ -268,11 +270,14 @@ impl Payload {
                 let partition_size = partition.new_partition_info.as_ref().map_or(0, |info| info.size.expect("info size not found"));
                 let partition_hash = partition.new_partition_info.as_ref().and_then( |info| info.hash.clone()).expect("msg");
 
-                println!("Name: {}|Size: {:?}|Hash: {},", partition_name, partition_size, hex::encode(partition_hash));
+                let mg = format!("{}|{:?}|{},", partition_name, partition_size, hex::encode(partition_hash));
+                msg.insert_str(msg.len(), mg.as_str());
+
             }
+                msg.remove(msg.len() - 1);
         } else {
-            println!("No partitions found");
+            msg = String::from("No partitions found");
         }
-        Ok("Done".into())
+        Ok(msg)
     }
 }
